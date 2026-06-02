@@ -189,4 +189,3 @@ print(f"[OK] Eventos en ventana: {len(window_rows)}")
 print(f"[OK] Eventos interesantes en ventana: {len(interesting_rows)}")
 print(f"[OK] Salida: {OUT_DIR}")
 print(f"[OK] Debug: {LOG_DIR / '59_evtx_parser_debug.txt'}")
-PY
