@@ -72,4 +72,3 @@ for r in selected:
 OUT.write_text("\n".join(lines) + "\n", encoding="utf-8")
 print(f"[OK] Timeline crítica escrita en: {OUT}")
 print(f"[OK] Eventos seleccionados: {len(selected)}")
-PY
