@@ -1,86 +1,36 @@
 from pathlib import Path
-from Evtx.Evtx import Evtx
 import xml.etree.ElementTree as ET
 import csv
 import re
 
-EVTX_DIR = Path.home() / "forense_challenge02" / "export" / "evtx"
-OUT_DIR = Path.home() / "forense_challenge02" / "parsed_evtx"
+XML_DIR = Path.home() / "forense_challenge02" / "parsed_evtx" / "xml"
+OUT_DIR = Path.home() / "forense_challenge02" / "parsed_evtx" / "tsv"
+LOG_DIR = Path.home() / "forense_challenge02" / "logs"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
-
-ALL_TSV = OUT_DIR / "events_all.tsv"
-WINDOW_TSV = OUT_DIR / "events_2015-12-12_0300-0330Z.tsv"
-SUSP_TSV = OUT_DIR / "events_2015-12-12_0300-0330Z_relevantes.tsv"
-ERRORS = OUT_DIR / "parse_errors.txt"
+LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 START = "2015-12-12T03:00:00"
 END   = "2015-12-12T03:30:00"
 
 INTERESTING_IDS = {
-    # Security
     "4624", "4625", "4634", "4647", "4672", "4688",
-    "4720", "4722", "4723", "4724", "4728", "4732", "4738",
-    "4776",
-    # System
-    "7036", "7040", "7045", "6005", "6006", "6008", "1074",
-    # Terminal Services
+    "4720", "4722", "4723", "4724", "4728", "4732", "4738", "4776",
+    "6005", "6006", "6008", "7036", "7040", "7045",
     "21", "22", "23", "24", "25", "39", "40", "41", "42",
-    # PowerShell
     "400", "403", "600", "800", "4103", "4104",
-    # Task Scheduler
     "106", "140", "141", "200", "201",
+    "1", "2", "3", "4", "5", "6"
 }
 
 KEYWORDS = re.compile(
-    r"(master|admin|administrator|remote|rdp|terminal|smb|powershell|cmd\.exe|"
-    r"net\.exe|net1\.exe|notepad|logon|logoff|special privileges|service|task|"
-    r"127\.0\.0\.1|192\.168|10\.|172\.)",
+    r"(master|administrator|admin|rdp|remote|terminal|smb|powershell|cmd\.exe|"
+    r"net\.exe|net1\.exe|notepad|service|logon|special privileges|profile|"
+    r"192\.168\.|10\.|172\.)",
     re.IGNORECASE
 )
 
-def local_name(tag):
-    return tag.split("}", 1)[-1] if "}" in tag else tag
-
-def first_text(root, wanted_name):
-    for elem in root.iter():
-        if local_name(elem.tag) == wanted_name:
-            return (elem.text or "").strip()
-    return ""
-
-def system_attr(root, elem_name, attr_name):
-    for elem in root.iter():
-        if local_name(elem.tag) == elem_name:
-            return elem.attrib.get(attr_name, "")
-    return ""
-
-def event_data(root):
-    data = {}
-    for elem in root.iter():
-        if local_name(elem.tag) == "Data":
-            name = elem.attrib.get("Name", "")
-            value = (elem.text or "").strip()
-            if name:
-                data[name] = value
-    return data
-
-def userdata_flat(root):
-    data = {}
-    for elem in root.iter():
-        lname = local_name(elem.tag)
-        if lname not in {"Event", "System", "EventData", "UserData"}:
-            text = (elem.text or "").strip()
-            if text and lname not in data:
-                data[lname] = text
-    return data
-
-def get_record_number(record):
-    try:
-        return str(record.record_num())
-    except Exception:
-        return ""
-
-fields = [
-    "LogFile", "RecordNumber", "TimeCreatedUTC", "EventID", "Provider",
+FIELDS = [
+    "LogFile", "TimeCreatedUTC", "EventRecordID", "EventID", "Provider",
     "Channel", "Computer", "SecurityUserID",
     "SubjectUserName", "SubjectDomainName",
     "TargetUserName", "TargetDomainName",
@@ -88,109 +38,155 @@ fields = [
     "IpAddress", "IpPort", "WorkstationName",
     "ProcessName", "NewProcessName", "CommandLine",
     "ServiceName", "ServiceFileName",
-    "TaskName", "Status", "SubStatus",
-    "MessageFields"
+    "TaskName", "User", "SessionID", "Address",
+    "Param1", "Param2", "DataSummary"
 ]
+
+def lname(tag):
+    return tag.split("}", 1)[-1] if "}" in tag else tag
+
+def find_text(root, name):
+    for e in root.iter():
+        if lname(e.tag) == name:
+            return (e.text or "").strip()
+    return ""
+
+def find_attr(root, name, attr):
+    for e in root.iter():
+        if lname(e.tag) == name:
+            return e.attrib.get(attr, "")
+    return ""
+
+def flatten_data(root):
+    data = {}
+    unnamed = 0
+
+    for e in root.iter():
+        tag = lname(e.tag)
+
+        if tag == "Data":
+            key = e.attrib.get("Name")
+            if not key:
+                key = f"Data{unnamed}"
+                unnamed += 1
+            data[key] = (e.text or "").strip()
+
+        elif tag not in {
+            "Event", "System", "EventData", "UserData", "Execution",
+            "Correlation", "Provider", "TimeCreated", "Security",
+            "Version", "Level", "Task", "Opcode", "Keywords",
+            "EventID", "EventRecordID", "Channel", "Computer"
+        }:
+            txt = (e.text or "").strip()
+            if txt:
+                if tag in data:
+                    i = 2
+                    while f"{tag}_{i}" in data:
+                        i += 1
+                    data[f"{tag}_{i}"] = txt
+                else:
+                    data[tag] = txt
+
+    return data
+
+def extract_event_blocks(text):
+    # evtxexport puede generar varios <Event>...</Event> seguidos sin raíz XML única.
+    return re.findall(r'<Event\b.*?</Event>', text, flags=re.DOTALL)
+
+def iter_events(xml_path):
+    text = xml_path.read_text(errors="ignore")
+
+    blocks = extract_event_blocks(text)
+    events = []
+
+    for block in blocks:
+        try:
+            events.append(ET.fromstring(block))
+        except ET.ParseError:
+            continue
+
+    return events
+
+def make_row(xml_path, ev):
+    data = flatten_data(ev)
+
+    event_id = find_text(ev, "EventID")
+    time = find_attr(ev, "TimeCreated", "SystemTime")
+
+    summary = " | ".join(
+        f"{k}={v}" for k, v in sorted(data.items())
+        if v
+    )
+
+    return {
+        "LogFile": xml_path.name,
+        "TimeCreatedUTC": time,
+        "EventRecordID": find_text(ev, "EventRecordID"),
+        "EventID": event_id,
+        "Provider": find_attr(ev, "Provider", "Name"),
+        "Channel": find_text(ev, "Channel"),
+        "Computer": find_text(ev, "Computer"),
+        "SecurityUserID": find_attr(ev, "Security", "UserID"),
+        "SubjectUserName": data.get("SubjectUserName", ""),
+        "SubjectDomainName": data.get("SubjectDomainName", ""),
+        "TargetUserName": data.get("TargetUserName", ""),
+        "TargetDomainName": data.get("TargetDomainName", ""),
+        "LogonType": data.get("LogonType", ""),
+        "LogonProcessName": data.get("LogonProcessName", ""),
+        "AuthenticationPackageName": data.get("AuthenticationPackageName", ""),
+        "IpAddress": data.get("IpAddress", ""),
+        "IpPort": data.get("IpPort", ""),
+        "WorkstationName": data.get("WorkstationName", ""),
+        "ProcessName": data.get("ProcessName", ""),
+        "NewProcessName": data.get("NewProcessName", ""),
+        "CommandLine": data.get("CommandLine", ""),
+        "ServiceName": data.get("ServiceName", ""),
+        "ServiceFileName": data.get("ServiceFileName", ""),
+        "TaskName": data.get("TaskName", ""),
+        "User": data.get("User", "") or data.get("UserName", ""),
+        "SessionID": data.get("SessionID", "") or data.get("SessionId", ""),
+        "Address": data.get("Address", "") or data.get("SourceAddress", ""),
+        "Param1": data.get("param1", "") or data.get("Param1", ""),
+        "Param2": data.get("param2", "") or data.get("Param2", ""),
+        "DataSummary": summary
+    }
 
 all_rows = []
 window_rows = []
-susp_rows = []
-errors = []
+interesting_rows = []
+debug_lines = []
 
-for evtx_path in sorted(EVTX_DIR.glob("*.evtx")):
-    try:
-        with Evtx(str(evtx_path)) as log:
-            for record in log.records():
-                try:
-                    xml = record.xml()
-                    root = ET.fromstring(xml)
+for xml_path in sorted(XML_DIR.glob("*.xml")):
+    events = iter_events(xml_path)
+    debug_lines.append(f"{xml_path.name}: {len(events)} eventos")
 
-                    ed = event_data(root)
-                    ud = userdata_flat(root)
+    for ev in events:
+        row = make_row(xml_path, ev)
+        all_rows.append(row)
 
-                    event_id = first_text(root, "EventID")
-                    provider = system_attr(root, "Provider", "Name")
-                    time_created = system_attr(root, "TimeCreated", "SystemTime")
-                    channel = first_text(root, "Channel")
-                    computer = first_text(root, "Computer")
-                    security_user = system_attr(root, "Security", "UserID")
+        t = row["TimeCreatedUTC"].replace("Z", "")
+        if START <= t < END:
+            window_rows.append(row)
 
-                    merged = {}
-                    merged.update(ud)
-                    merged.update(ed)
-
-                    row = {
-                        "LogFile": evtx_path.name,
-                        "RecordNumber": get_record_number(record),
-                        "TimeCreatedUTC": time_created,
-                        "EventID": event_id,
-                        "Provider": provider,
-                        "Channel": channel,
-                        "Computer": computer,
-                        "SecurityUserID": security_user,
-                        "SubjectUserName": merged.get("SubjectUserName", ""),
-                        "SubjectDomainName": merged.get("SubjectDomainName", ""),
-                        "TargetUserName": merged.get("TargetUserName", ""),
-                        "TargetDomainName": merged.get("TargetDomainName", ""),
-                        "LogonType": merged.get("LogonType", ""),
-                        "LogonProcessName": merged.get("LogonProcessName", ""),
-                        "AuthenticationPackageName": merged.get("AuthenticationPackageName", ""),
-                        "IpAddress": merged.get("IpAddress", ""),
-                        "IpPort": merged.get("IpPort", ""),
-                        "WorkstationName": merged.get("WorkstationName", ""),
-                        "ProcessName": merged.get("ProcessName", ""),
-                        "NewProcessName": merged.get("NewProcessName", ""),
-                        "CommandLine": merged.get("CommandLine", ""),
-                        "ServiceName": merged.get("ServiceName", ""),
-                        "ServiceFileName": merged.get("ServiceFileName", ""),
-                        "TaskName": merged.get("TaskName", ""),
-                        "Status": merged.get("Status", ""),
-                        "SubStatus": merged.get("SubStatus", ""),
-                        "MessageFields": " | ".join(
-                            f"{k}={v}" for k, v in sorted(merged.items())
-                            if v and k not in {
-                                "SubjectUserName", "SubjectDomainName",
-                                "TargetUserName", "TargetDomainName",
-                                "LogonType", "LogonProcessName",
-                                "AuthenticationPackageName", "IpAddress",
-                                "IpPort", "WorkstationName", "ProcessName",
-                                "NewProcessName", "CommandLine",
-                                "ServiceName", "ServiceFileName", "TaskName",
-                                "Status", "SubStatus"
-                            }
-                        )
-                    }
-
-                    all_rows.append(row)
-
-                    # Comparación ISO aproximada: todas están en Z.
-                    t = time_created.replace("Z", "")
-                    if START <= t < END:
-                        window_rows.append(row)
-                        joined = "\t".join(row.values())
-                        if event_id in INTERESTING_IDS or KEYWORDS.search(joined):
-                            susp_rows.append(row)
-
-                except Exception as e:
-                    errors.append(f"{evtx_path.name}: record parse error: {e}")
-    except Exception as e:
-        errors.append(f"{evtx_path.name}: file open error: {e}")
+            joined = "\t".join(row.get(f, "") for f in FIELDS)
+            if row["EventID"] in INTERESTING_IDS or KEYWORDS.search(joined):
+                interesting_rows.append(row)
 
 def write_tsv(path, rows):
     with path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fields, delimiter="\t", extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows(rows)
+        w = csv.DictWriter(f, fieldnames=FIELDS, delimiter="\t", extrasaction="ignore")
+        w.writeheader()
+        w.writerows(rows)
 
-write_tsv(ALL_TSV, all_rows)
-write_tsv(WINDOW_TSV, window_rows)
-write_tsv(SUSP_TSV, susp_rows)
+write_tsv(OUT_DIR / "events_all.tsv", all_rows)
+write_tsv(OUT_DIR / "events_window_2015-12-12_0300-0330Z.tsv", window_rows)
+write_tsv(OUT_DIR / "events_interesting_2015-12-12_0300-0330Z.tsv", interesting_rows)
 
-ERRORS.write_text("\n".join(errors), encoding="utf-8")
+(LOG_DIR / "59_evtx_parser_debug.txt").write_text("\n".join(debug_lines), encoding="utf-8")
 
 print(f"[OK] Eventos totales: {len(all_rows)}")
-print(f"[OK] Eventos ventana 03:00-03:30Z: {len(window_rows)}")
-print(f"[OK] Eventos relevantes ventana: {len(susp_rows)}")
+print(f"[OK] Eventos en ventana: {len(window_rows)}")
+print(f"[OK] Eventos interesantes en ventana: {len(interesting_rows)}")
 print(f"[OK] Salida: {OUT_DIR}")
-print(f"[OK] Errores: {len(errors)}")
+print(f"[OK] Debug: {LOG_DIR / '59_evtx_parser_debug.txt'}")
 PY
