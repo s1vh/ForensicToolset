@@ -117,4 +117,3 @@ for r in rows:
             f'{r["Provider"]}\t{trunc(r["DataSummary"], 300)}'
         )
 write("73_keyword_hits.txt", lines)
-PY
